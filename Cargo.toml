@@ -2,5 +2,9 @@
 name = "lf-rs"
 version = "0.1.0"
 edition = "2021"
+description = "A lock-free & eventually consistent concurrency primitive for any state machine"
+repository = "https://github.com/lockbook/lf-rs"
+license = "BSD-3-Clause"
+keywords = ["notes", "encryption", "productivity", "automation", "security"]
 
 [dependencies]
