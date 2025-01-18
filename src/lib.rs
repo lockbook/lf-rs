@@ -1,80 +1,111 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use std::{ops::Deref, sync::mpsc};
 
 /// A trait for **deterministic** updates. By using this trait, you herby swear the following solemn oath:
 /// > I swear by my life and my love of it that I will never implement this trait in a way that is not deterministic.
 pub trait Update<T>: Sized {
     fn apply(&self, target: &mut T);
-    fn apply_final(self, target: &mut T) {
-        self.apply(target);
-    }
 }
 
-impl<F, T> Update<T> for F
+impl<T> Update<T> for T
 where
-    F: Fn(&mut T),
+    T: Copy,
 {
     fn apply(&self, target: &mut T) {
-        self(target);
+        *target = *self;
     }
 }
 
-/// A double buffer for state machines.
-pub struct DoubleBuffer<State> {
-    state_a: Arc<RwLock<State>>,
-    state_b: Arc<RwLock<State>>,
-    read_a: Arc<AtomicBool>,
+#[derive(Debug)]
+pub struct Leader<S, U: Update<S>> {
+    state: S,
+    subscribers: Vec<mpsc::Sender<U>>,
 }
 
-impl<State> DoubleBuffer<State> {
-    pub fn new(initial_state: State, initial_state_clone: State) -> Self {
-        let state_a = Arc::new(RwLock::new(initial_state));
-        let state_b = Arc::new(RwLock::new(initial_state_clone));
-        let read_a = Arc::new(AtomicBool::new(false));
+impl<S, U: Update<S>> Deref for Leader<S, U> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
+    pub fn new(state: S) -> Self {
         Self {
-            state_a,
-            state_b,
-            read_a,
+            state,
+            subscribers: Vec::new(),
         }
     }
 
-    pub fn read(&self) -> RwLockReadGuard<State> {
-        if self.read_a.load(Ordering::Relaxed) {
-            self.state_a.read().unwrap()
-        } else {
-            self.state_b.read().unwrap()
+    pub fn update(&mut self, update: U)
+    where
+        U: Update<S>,
+    {
+        update.apply(&mut self.state);
+        for subscriber in &self.subscribers {
+            subscriber.send(update.clone()).unwrap();
         }
     }
 
-    fn write(&self) -> RwLockWriteGuard<State> {
-        if self.read_a.load(Ordering::Relaxed) {
-            self.state_b.write().unwrap()
-        } else {
-            self.state_a.write().unwrap()
+    pub fn follow(&mut self) -> Follower<S, U> {
+        let (tx, rx) = mpsc::channel();
+        self.subscribers.push(tx);
+        Follower::new(self.state.clone(), rx)
+    }
+}
+
+#[derive(Debug)]
+pub struct Follower<S, U: Update<S>> {
+    state: S,
+    subscription: mpsc::Receiver<U>,
+}
+
+impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
+    pub fn new(state: S, subscription: mpsc::Receiver<U>) -> Self {
+        Self {
+            state,
+            subscription,
         }
     }
 
-    fn swap(&self) {
-        self.read_a.fetch_not(Ordering::Relaxed);
+    pub fn update(&mut self) {
+        while let Ok(update) = self.subscription.try_recv() {
+            update.apply(&mut self.state);
+        }
     }
 
-    pub fn apply<U: Update<State>>(&self, update: U) {
-        update.apply(&mut self.write());
-        self.swap();
-        update.apply(&mut self.write());
+    pub fn get(&self) -> Guard<S> {
+        Guard { state: &self.state }
+    }
+}
+
+pub struct Guard<'a, S> {
+    state: &'a S,
+}
+
+impl<S> Deref for Guard<'_, S> {
+    type Target = S;
+
+    fn deref(&self) -> &Self::Target {
+        self.state
     }
 }
 
 #[cfg(test)]
-mod tests {
+mod test {
     use super::*;
 
     #[test]
-    fn i32() {
-        let buffer = DoubleBuffer::new(0, 0);
-        buffer.apply(|x: &mut i32| *x += 1);
-        assert_eq!(*buffer.read(), 1);
+    fn test() {
+        let leader = &mut Leader::new(420);
+        let follower = &mut leader.follow();
+
+        leader.update(69);
+
+        assert!(*follower.get().state == 420);
+
+        follower.update();
+
+        assert!(*follower.get().state == 69);
     }
 }

@@ -8,3 +8,6 @@ license = "BSD-3-Clause"
 keywords = ["notes", "encryption", "productivity", "automation", "security"]
 
 [dependencies]
+atom = "0.4.0"
+pulse = "0.5.3"
+diff-struct = "0.5.3"
