@@ -1,30 +1,30 @@
 use std::{
     ops::Deref,
-    sync::mpsc::{self, SendError},
+    sync::mpsc::{self, SendError, TryRecvError},
 };
 
 /// A trait for **deterministic** updates. By using this trait, you herby swear the following solemn oath:
 /// > I swear by my life and my love of it that I will never implement this trait in a way that is not deterministic.
-pub trait Update<T>: Sized {
-    fn apply(&self, target: &mut T);
+pub trait Event<S>: Sized {
+    fn apply(&self, target: &mut S);
 }
 
-impl<T> Update<T> for T
+impl<S> Event<S> for S
 where
-    T: Copy,
+    S: Copy,
 {
-    fn apply(&self, target: &mut T) {
+    fn apply(&self, target: &mut S) {
         *target = *self;
     }
 }
 
 #[derive(Debug)]
-pub struct Leader<S, U: Update<S>> {
+pub struct Leader<S, E: Event<S>> {
     state: S,
-    subscribers: Vec<mpsc::Sender<U>>,
+    subscribers: Vec<mpsc::Sender<E>>,
 }
 
-impl<S, U: Update<S>> Deref for Leader<S, U> {
+impl<S, E: Event<S>> Deref for Leader<S, E> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -32,7 +32,7 @@ impl<S, U: Update<S>> Deref for Leader<S, U> {
     }
 }
 
-impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
+impl<S: Clone, E: Event<S> + Clone> Leader<S, E> {
     pub fn new(state: S) -> Self {
         Self {
             state,
@@ -40,9 +40,9 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
         }
     }
 
-    pub fn update(&mut self, update: U)
+    pub fn update(&mut self, update: E)
     where
-        U: Update<S>,
+        E: Event<S>,
     {
         update.apply(&mut self.state);
 
@@ -53,7 +53,7 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
         }
     }
 
-    pub fn follow(&mut self) -> Follower<S, U> {
+    pub fn follow(&mut self) -> Follower<S, E> {
         let (tx, rx) = mpsc::channel();
         self.subscribers.push(tx);
         Follower::new(self.state.clone(), rx)
@@ -61,27 +61,30 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
 }
 
 #[derive(Debug)]
-pub struct Follower<S, U: Update<S>> {
+pub struct Follower<S, E: Event<S>> {
     state: S,
-    subscription: mpsc::Receiver<U>,
+    subscription: mpsc::Receiver<E>,
 }
 
-impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
-    pub fn new(state: S, subscription: mpsc::Receiver<U>) -> Self {
+impl<S: Clone, E: Event<S> + Clone> Follower<S, E> {
+    pub fn new(state: S, subscription: mpsc::Receiver<E>) -> Self {
         Self {
             state,
             subscription,
         }
     }
 
-    pub fn update(&mut self) {
-        while let Ok(update) = self.subscription.try_recv() {
-            update.apply(&mut self.state);
+    pub fn refresh(&mut self) -> TryRecvError {
+        loop {
+            match self.subscription.try_recv() {
+                Ok(update) => update.apply(&mut self.state),
+                Err(e) => break e,
+            }
         }
     }
 }
 
-impl<S, U: Update<S>> Deref for Follower<S, U> {
+impl<S, E: Event<S>> Deref for Follower<S, E> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -103,7 +106,7 @@ mod test {
         let f: i32 = *follower;
         assert_eq!(f, 420);
 
-        follower.update();
+        let _ = follower.refresh();
 
         let f: i32 = *follower;
         assert_eq!(f, 69);
