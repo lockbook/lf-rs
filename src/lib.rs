@@ -84,7 +84,7 @@ impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
         }
     }
 
-    /// Applies all available update, waiting for at least one update to become available.
+    /// Applies all available updates, waiting for at least one update to become available.
     pub fn receive_updates(&mut self) -> Result<(), RecvError> {
         self.subscription.recv()?.apply(&mut self.state);
         match self.try_receive_updates() {
@@ -116,7 +116,7 @@ mod test {
         let f: i32 = *follower;
         assert_eq!(f, 420);
 
-        let _ = follower.try_receive_updates();
+        follower.try_receive_updates();
 
         let f: i32 = *follower;
         assert_eq!(f, 69);
