@@ -1,4 +1,7 @@
-use std::{ops::Deref, sync::mpsc};
+use std::{
+    ops::Deref,
+    sync::mpsc::{self, SendError},
+};
 
 /// A trait for **deterministic** updates. By using this trait, you herby swear the following solemn oath:
 /// > I swear by my life and my love of it that I will never implement this trait in a way that is not deterministic.
@@ -42,8 +45,11 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
         U: Update<S>,
     {
         update.apply(&mut self.state);
-        for subscriber in &self.subscribers {
-            subscriber.send(update.clone()).unwrap();
+
+        for i in (0..self.subscribers.len()).rev() {
+            if let Err(SendError(_)) = self.subscribers[i].send(update.clone()) {
+                self.subscribers.remove(i);
+            }
         }
     }
 
@@ -73,21 +79,13 @@ impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
             update.apply(&mut self.state);
         }
     }
-
-    pub fn get(&self) -> Guard<S> {
-        Guard { state: &self.state }
-    }
 }
 
-pub struct Guard<'a, S> {
-    state: &'a S,
-}
-
-impl<S> Deref for Guard<'_, S> {
+impl<S, U: Update<S>> Deref for Follower<S, U> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
-        self.state
+        &self.state
     }
 }
 
@@ -97,15 +95,17 @@ mod test {
 
     #[test]
     fn test() {
-        let leader = &mut Leader::new(420);
-        let follower = &mut leader.follow();
+        let mut leader = Leader::new(420);
+        let mut follower = leader.follow();
 
         leader.update(69);
 
-        assert!(*follower.get().state == 420);
+        let f: i32 = *follower;
+        assert_eq!(f, 420);
 
         follower.update();
 
-        assert!(*follower.get().state == 69);
+        let f: i32 = *follower;
+        assert_eq!(f, 69);
     }
 }
