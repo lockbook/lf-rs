@@ -1,7 +1,4 @@
-use std::{
-    ops::Deref,
-    sync::mpsc::{self, RecvError, SendError, TryRecvError},
-};
+use std::{ops::Deref, sync::mpsc};
 
 // State
 #[derive(Clone, Debug)]
@@ -24,14 +21,51 @@ where
     }
 }
 
-// Leader
-#[derive(Debug)]
-pub struct Leader<S, U: Update<S>> {
-    state: State<S>,
-    subscribers: Vec<mpsc::Sender<(U, u64)>>,
+// Transport
+pub trait Sender<U>: Sized {
+    type SendError;
+
+    fn send(&self, update: U) -> Result<(), Self::SendError>;
 }
 
-impl<S, U: Update<S>> Deref for Leader<S, U> {
+pub trait Receiver<U> {
+    type TryRecvError;
+    type RecvError;
+
+    fn try_recv(&self) -> Result<U, Self::TryRecvError>;
+    fn recv(&self) -> Result<U, Self::RecvError>;
+}
+
+impl<U> Sender<U> for mpsc::Sender<U> {
+    type SendError = mpsc::SendError<U>;
+
+    fn send(&self, update: U) -> Result<(), Self::SendError> {
+        self.send(update)
+    }
+}
+
+impl<U> Receiver<U> for mpsc::Receiver<U> {
+    type TryRecvError = mpsc::TryRecvError;
+    type RecvError = mpsc::RecvError;
+
+    fn try_recv(&self) -> Result<U, Self::TryRecvError> {
+        self.try_recv()
+    }
+
+    fn recv(&self) -> Result<U, Self::RecvError> {
+        self.recv()
+    }
+}
+
+// Leader
+#[derive(Debug)]
+pub struct Leader<S, U: Update<S>, Tx: Sender<(U, u64)>> {
+    state: State<S>,
+    followers: Vec<Tx>,
+    _update: std::marker::PhantomData<U>,
+}
+
+impl<S, U: Update<S>, Tx: Sender<(U, u64)>> Deref for Leader<S, U, Tx> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -39,14 +73,15 @@ impl<S, U: Update<S>> Deref for Leader<S, U> {
     }
 }
 
-impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
+impl<S: Clone, U: Update<S> + Clone, Tx: Sender<(U, u64)>> Leader<S, U, Tx> {
     pub fn new(state: S) -> Self {
         Self {
             state: State {
                 snapshot: state,
                 seq: 0,
             },
-            subscribers: Vec::new(),
+            followers: Vec::new(),
+            _update: std::marker::PhantomData,
         }
     }
 
@@ -57,19 +92,20 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
         update.apply(&mut self.state.snapshot);
         self.state.seq += 1;
 
-        for i in (0..self.subscribers.len()).rev() {
-            if let Err(SendError(_)) = self.subscribers[i].send((update.clone(), self.state.seq)) {
-                self.subscribers.remove(i);
+        for i in (0..self.followers.len()).rev() {
+            if self.followers[i]
+                .send((update.clone(), self.state.seq))
+                .is_err()
+            {
+                self.followers.remove(i);
             }
         }
 
         self.state.seq
     }
 
-    pub fn follow(&mut self) -> Follower<S, U> {
-        let (tx, rx) = mpsc::channel();
-        self.subscribers.push(tx);
-        Follower::new(self.state.clone(), rx)
+    pub fn lead(&mut self, tx: Tx) {
+        self.followers.push(tx);
     }
 
     pub fn seq(&self) -> u64 {
@@ -79,49 +115,38 @@ impl<S: Clone, U: Update<S> + Clone> Leader<S, U> {
 
 // Follower
 #[derive(Debug)]
-pub struct Follower<S, U: Update<S>> {
+pub struct Follower<S, U: Update<S>, Rx: Receiver<(U, u64)>> {
     state: State<S>,
-    subscription: mpsc::Receiver<(U, u64)>,
-    subscribers: Vec<mpsc::Sender<(U, u64)>>,
+    leader: Rx,
     waiters: Vec<(pulse::Pulse, u64)>,
+    _update: std::marker::PhantomData<U>,
 }
 
-impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
-    pub fn new(state: State<S>, subscription: mpsc::Receiver<(U, u64)>) -> Self {
+// todo: feature gate or something
+impl<S: Clone, U: Update<S> + Clone> Follower<S, U, mpsc::Receiver<(U, u64)>> {
+    pub fn follow(leader: &mut Leader<S, U, mpsc::Sender<(U, u64)>>) -> Self {
+        let (tx, rx) = mpsc::channel();
+        leader.lead(tx);
         Self {
-            state,
-            subscription,
-            subscribers: Vec::new(),
+            state: leader.state.clone(),
+            leader: rx,
             waiters: Vec::new(),
+            _update: std::marker::PhantomData,
         }
     }
+}
 
+impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<(U, u64)>> Follower<S, U, Rx> {
     /// Applies all available updates.
-    pub fn refresh(&mut self) -> TryRecvError {
+    pub fn refresh(&mut self) -> <Rx as Receiver<(U, u64)>>::TryRecvError {
         loop {
-            match self.subscription.try_recv() {
+            match self.leader.try_recv() {
                 Ok((update, seq)) => {
                     self.apply(update, seq);
                 }
                 Err(e) => return e,
             }
         }
-    }
-
-    /// Applies all available updates, waiting for at least one update to become available.
-    pub fn refresh_blocking(&mut self) -> Result<(), RecvError> {
-        let (update, seq) = self.subscription.recv()?;
-        self.apply(update, seq);
-        match self.refresh() {
-            TryRecvError::Disconnected => Err(RecvError),
-            TryRecvError::Empty => Ok(()),
-        }
-    }
-
-    pub fn follow(&mut self) -> Follower<S, U> {
-        let (tx, rx) = mpsc::channel();
-        self.subscribers.push(tx);
-        Follower::new(self.state.clone(), rx)
     }
 
     pub fn seq(&self) -> u64 {
@@ -133,35 +158,16 @@ impl<S: Clone, U: Update<S> + Clone> Follower<S, U> {
     pub fn signal_at(&mut self, seq: u64) -> pulse::Signal {
         let (signal, pulse) = pulse::Signal::new();
         self.waiters.push((pulse, seq));
-        self.check_waiters();
         signal
     }
 
     fn apply(&mut self, update: U, seq: u64) {
         update.apply(&mut self.state.snapshot);
         self.state.seq = seq;
-
-        for i in (0..self.subscribers.len()).rev() {
-            if let Err(SendError(_)) = self.subscribers[i].send((update.clone(), self.state.seq)) {
-                self.subscribers.remove(i);
-            }
-        }
-
-        self.check_waiters();
-    }
-
-    fn check_waiters(&mut self) {
-        for i in (0..self.waiters.len()).rev() {
-            let (_, seq) = &self.waiters[i];
-            if *seq <= self.state.seq {
-                let (pulse, _) = self.waiters.remove(i);
-                pulse.pulse();
-            }
-        }
     }
 }
 
-impl<S, U: Update<S>> Deref for Follower<S, U> {
+impl<S, U: Update<S>, Rx: Receiver<(U, u64)>> Deref for Follower<S, U, Rx> {
     type Target = S;
 
     fn deref(&self) -> &Self::Target {
@@ -171,14 +177,12 @@ impl<S, U: Update<S>> Deref for Follower<S, U> {
 
 #[cfg(test)]
 mod test {
-    use std::thread;
-
     use super::*;
 
     #[test]
     fn test() {
         let mut leader = Leader::new(420);
-        let mut follower = leader.follow();
+        let mut follower = Follower::follow(&mut leader);
 
         leader.update(69);
 
@@ -195,7 +199,7 @@ mod test {
     #[test]
     fn test_seq() {
         let mut leader = Leader::new(420);
-        let mut follower = leader.follow();
+        let mut follower = Follower::follow(&mut leader);
 
         assert_eq!(leader.seq(), 0);
 
@@ -209,58 +213,11 @@ mod test {
         assert_eq!(follower.seq(), 1);
     }
 
-    // change notification: update relay
-    #[test]
-    fn test_relay() {
-        let mut leader = Leader::new(420);
-        let mut follower = leader.follow();
-        let mut follower2 = follower.follow();
-
-        leader.update(69);
-
-        let f: i32 = *follower;
-        assert_eq!(f, 420);
-
-        follower.refresh();
-
-        let f: i32 = *follower;
-        assert_eq!(f, 69);
-
-        let f: i32 = *follower2;
-        assert_eq!(f, 420);
-
-        follower2.refresh();
-
-        let f: i32 = *follower2;
-        assert_eq!(f, 69);
-    }
-
-    // change notification: blocking refresh
-    #[test]
-    fn test_blocking() {
-        let mut leader = Leader::new(420);
-        let mut follower = leader.follow();
-
-        let handle = thread::spawn(move || {
-            leader.update(69);
-        });
-
-        let f: i32 = *follower;
-        assert_eq!(f, 420);
-
-        let _ = follower.refresh_blocking();
-
-        let f: i32 = *follower;
-        assert_eq!(f, 69);
-
-        handle.join().unwrap();
-    }
-
     // change notification: pulse
     #[test]
     fn test_pulse() {
         let mut leader = Leader::new(420);
-        let mut follower = leader.follow();
+        let mut follower = Follower::follow(&mut leader);
 
         let seq = leader.update(69);
         let signal = follower.signal_at(seq);
@@ -268,11 +225,10 @@ mod test {
         let f: i32 = *follower;
         assert_eq!(f, 420);
 
-        let _ = follower.refresh_blocking();
+        follower.refresh();
+        signal.wait().unwrap();
 
         let f: i32 = *follower;
         assert_eq!(f, 69);
-
-        signal.wait().unwrap();
     }
 }
