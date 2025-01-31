@@ -1,84 +1,13 @@
-use std::sync::mpsc;
+mod sequenced;
+mod transport;
+mod update;
 
-/// The `Update` trait represets a deterministic state transition for another type. Implement this trait to unlock the
-/// features of this crate.
-pub trait Update<S>: Sized {
-    fn apply(&self, target: &mut S);
-}
+pub use sequenced::Sequenced;
+pub use transport::{Receiver, Sender};
+pub use update::Update;
 
-// All copy types are updates of themselves. The update is simply to overwrite the value.
-impl<S> Update<S> for S
-where
-    S: Copy,
-{
-    fn apply(&self, target: &mut S) {
-        *target = *self;
-    }
-}
-
-// Sequenced data has changes that occur at ordered sequence numbers.
-#[derive(Clone, Debug)]
-pub struct Sequenced<S> {
-    value: S,
-    seq: u64,
-}
-
-impl<S> Sequenced<S> {
-    pub fn new(value: S) -> Self {
-        Self { value, seq: 0 }
-    }
-}
-
-// Sequenced updates are updates for sequenced data. The sequence number of the sequenced data will be updated to the
-// sequence number of the sequenced update. Such are the updates to the sequence of sequenced updates.
-impl<S, U> Update<Sequenced<S>> for Sequenced<U>
-where
-    U: Update<S>,
-{
-    fn apply(&self, target: &mut Sequenced<S>) {
-        self.value.apply(&mut target.value);
-        target.seq = self.seq;
-    }
-}
-
-// Transport
-pub trait Sender<U>: Sized {
-    type SendError;
-
-    fn send(&self, update: U) -> Result<(), Self::SendError>;
-}
-
-pub trait Receiver<U> {
-    type TryRecvError;
-    type RecvError;
-
-    fn try_recv(&self) -> Result<U, Self::TryRecvError>;
-    fn recv(&self) -> Result<U, Self::RecvError>;
-}
-
-// todo: feature gate or something
-impl<U> Sender<U> for mpsc::Sender<U> {
-    type SendError = mpsc::SendError<U>;
-
-    fn send(&self, update: U) -> Result<(), Self::SendError> {
-        self.send(update)
-    }
-}
-
-impl<U> Receiver<U> for mpsc::Receiver<U> {
-    type TryRecvError = mpsc::TryRecvError;
-    type RecvError = mpsc::RecvError;
-
-    fn try_recv(&self) -> Result<U, Self::TryRecvError> {
-        self.try_recv()
-    }
-
-    fn recv(&self) -> Result<U, Self::RecvError> {
-        self.recv()
-    }
-}
-
-// Leader
+/// Leaders are state replicas that both apply and emit updates submitted by callers. Followers follow leaders,
+/// replicating their state by applying the emitted updates.
 #[derive(Debug)]
 pub struct Leader<S, U: Update<S>, Tx: Sender<U>> {
     state: S,
@@ -87,6 +16,7 @@ pub struct Leader<S, U: Update<S>, Tx: Sender<U>> {
 }
 
 impl<S: Clone, U: Update<S>, Tx: Sender<U>> Leader<S, U, Tx> {
+    /// Create a leader with the given state and follower.
     pub fn new(state: S, follower: Tx) -> Self {
         Self {
             state,
@@ -95,6 +25,7 @@ impl<S: Clone, U: Update<S>, Tx: Sender<U>> Leader<S, U, Tx> {
         }
     }
 
+    /// Apply the update to this leader and send it to the follower.
     pub fn update(&mut self, update: U) -> Result<(), Tx::SendError>
     where
         U: Update<S>,
@@ -106,10 +37,12 @@ impl<S: Clone, U: Update<S>, Tx: Sender<U>> Leader<S, U, Tx> {
 }
 
 impl<S: Clone, U: Update<S>, Tx: Sender<Sequenced<U>>> Leader<Sequenced<S>, Sequenced<U>, Tx> {
+    /// Get the sequence number of this sequenced leader.
     pub fn seq(&self) -> u64 {
         self.state.seq
     }
 
+    /// Apply the update to this sequenced leader and send it to the follower. Automatically maintains sequence numbers.
     pub fn sequenced_update(&mut self, update: U) -> Result<(), Tx::SendError> {
         self.state.seq += 1;
         let sequenced_update = Sequenced {
@@ -121,7 +54,8 @@ impl<S: Clone, U: Update<S>, Tx: Sender<Sequenced<U>>> Leader<Sequenced<S>, Sequ
     }
 }
 
-// Follower
+/// Followers are state replicas that only apply updates emitted from the leader. Every observed state of the follower
+/// is guaranteed to have been a real state of the leader at some point in time.
 #[derive(Debug)]
 pub struct Follower<S, U: Update<S>, Rx: Receiver<U>> {
     state: S,
@@ -140,6 +74,7 @@ impl<S: Clone, U: Update<S>, Rx: Receiver<U>> Follower<S, U, Rx> {
 }
 
 impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<U>> Follower<S, U, Rx> {
+    /// Read the state of the follower, applying all received updates first.
     pub fn read(&mut self) -> &S {
         loop {
             match self.leader.try_recv() {
@@ -194,6 +129,8 @@ impl<S: Clone, U: Update<S>, Tx: Sender<U>, Rx: Receiver<U>> IntoLeaderFollower<
 
 #[cfg(test)]
 mod test {
+    use std::sync::mpsc;
+
     use super::*;
 
     #[test]
