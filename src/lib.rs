@@ -1,23 +1,43 @@
-use std::{ops::Deref, sync::mpsc};
+use std::sync::mpsc;
 
-// State
-#[derive(Clone, Debug)]
-pub struct State<S> {
-    snapshot: S,
-    seq: u64,
-}
-
-// Update
+/// The `Update` trait represets a deterministic state transition for another type. Implement this trait to unlock the
+/// features of this crate.
 pub trait Update<S>: Sized {
     fn apply(&self, target: &mut S);
 }
 
+// All copy types are updates of themselves. The update is simply to overwrite the value.
 impl<S> Update<S> for S
 where
     S: Copy,
 {
     fn apply(&self, target: &mut S) {
         *target = *self;
+    }
+}
+
+// Sequenced data has changes that occur at ordered sequence numbers.
+#[derive(Clone, Debug)]
+pub struct Sequenced<S> {
+    value: S,
+    seq: u64,
+}
+
+impl<S> Sequenced<S> {
+    pub fn new(value: S) -> Self {
+        Self { value, seq: 0 }
+    }
+}
+
+// Sequenced updates are updates for sequenced data. The sequence number of the sequenced data will be updated to the
+// sequence number of the sequenced update. Such are the updates to the sequence of sequenced updates.
+impl<S, U> Update<Sequenced<S>> for Sequenced<U>
+where
+    U: Update<S>,
+{
+    fn apply(&self, target: &mut Sequenced<S>) {
+        self.value.apply(&mut target.value);
+        target.seq = self.seq;
     }
 }
 
@@ -36,6 +56,7 @@ pub trait Receiver<U> {
     fn recv(&self) -> Result<U, Self::RecvError>;
 }
 
+// todo: feature gate or something
 impl<U> Sender<U> for mpsc::Sender<U> {
     type SendError = mpsc::SendError<U>;
 
@@ -59,119 +80,110 @@ impl<U> Receiver<U> for mpsc::Receiver<U> {
 
 // Leader
 #[derive(Debug)]
-pub struct Leader<S, U: Update<S>, Tx: Sender<(U, u64)>> {
-    state: State<S>,
+pub struct Leader<S, U: Update<S>, Tx: Sender<U>> {
+    state: S,
     followers: Vec<Tx>,
     _update: std::marker::PhantomData<U>,
 }
 
-impl<S, U: Update<S>, Tx: Sender<(U, u64)>> Deref for Leader<S, U, Tx> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state.snapshot
-    }
-}
-
-impl<S: Clone, U: Update<S> + Clone, Tx: Sender<(U, u64)>> Leader<S, U, Tx> {
+impl<S: Clone, U: Update<S> + Clone, Tx: Sender<U>> Leader<S, U, Tx> {
     pub fn new(state: S) -> Self {
         Self {
-            state: State {
-                snapshot: state,
-                seq: 0,
-            },
+            state,
             followers: Vec::new(),
             _update: std::marker::PhantomData,
         }
     }
 
-    pub fn update(&mut self, update: U) -> u64
+    pub fn update(&mut self, update: U)
     where
         U: Update<S>,
     {
-        update.apply(&mut self.state.snapshot);
-        self.state.seq += 1;
+        update.apply(&mut self.state);
 
         for i in (0..self.followers.len()).rev() {
-            if self.followers[i]
-                .send((update.clone(), self.state.seq))
-                .is_err()
-            {
+            if self.followers[i].send(update.clone()).is_err() {
                 self.followers.remove(i);
             }
         }
-
-        self.state.seq
     }
 
     pub fn lead(&mut self, tx: Tx) {
         self.followers.push(tx);
     }
+}
 
+impl<S: Clone, U: Update<S> + Clone, Tx: Sender<Sequenced<U>>>
+    Leader<Sequenced<S>, Sequenced<U>, Tx>
+{
     pub fn seq(&self) -> u64 {
         self.state.seq
+    }
+
+    pub fn sequenced_update(&mut self, update: U) {
+        self.state.seq += 1;
+        let sequenced_update = Sequenced {
+            value: update,
+            seq: self.state.seq,
+        };
+
+        self.update(sequenced_update);
     }
 }
 
 // Follower
 #[derive(Debug)]
-pub struct Follower<S, U: Update<S>, Rx: Receiver<(U, u64)>> {
-    state: State<S>,
+pub struct Follower<S, U: Update<S>, Rx: Receiver<U>> {
+    state: S,
     leader: Rx,
-    waiters: Vec<(pulse::Pulse, u64)>,
     _update: std::marker::PhantomData<U>,
 }
 
-// todo: feature gate or something
-impl<S: Clone, U: Update<S> + Clone> Follower<S, U, mpsc::Receiver<(U, u64)>> {
-    pub fn follow(leader: &mut Leader<S, U, mpsc::Sender<(U, u64)>>) -> Self {
+impl<S: Clone, U: Update<S> + Clone> Follower<S, U, mpsc::Receiver<U>> {
+    pub fn follow(leader: &mut Leader<S, U, mpsc::Sender<U>>) -> Self {
         let (tx, rx) = mpsc::channel();
         leader.lead(tx);
         Self {
             state: leader.state.clone(),
             leader: rx,
-            waiters: Vec::new(),
             _update: std::marker::PhantomData,
         }
     }
 }
 
-impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<(U, u64)>> Follower<S, U, Rx> {
-    /// Applies all available updates.
-    pub fn refresh(&mut self) -> <Rx as Receiver<(U, u64)>>::TryRecvError {
+impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<U>> Follower<S, U, Rx> {
+    pub fn read(&mut self) -> &S {
         loop {
             match self.leader.try_recv() {
-                Ok((update, seq)) => {
-                    self.apply(update, seq);
+                Ok(update) => {
+                    update.apply(&mut self.state);
                 }
-                Err(e) => return e,
+                Err(_) => return &self.state,
             }
         }
     }
+}
 
+impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<Sequenced<U>>>
+    Follower<Sequenced<S>, Sequenced<U>, Rx>
+{
+    /// Returns the sequence number of the state.
     pub fn seq(&self) -> u64 {
         self.state.seq
     }
 
-    /// Returns a pulse::Signal which can be used to wait for the follower to reach a certain sequence number in sync
-    /// or async contexts.
-    pub fn signal_at(&mut self, seq: u64) -> pulse::Signal {
-        let (signal, pulse) = pulse::Signal::new();
-        self.waiters.push((pulse, seq));
-        signal
+    /// Convenience function for reading sequenced state without the sequence number.
+    pub fn sequenced_read(&mut self) -> &S {
+        &self.read().value
     }
 
-    fn apply(&mut self, update: U, seq: u64) {
-        update.apply(&mut self.state.snapshot);
-        self.state.seq = seq;
-    }
-}
-
-impl<S, U: Update<S>, Rx: Receiver<(U, u64)>> Deref for Follower<S, U, Rx> {
-    type Target = S;
-
-    fn deref(&self) -> &Self::Target {
-        &self.state.snapshot
+    /// Blocks until the sequence number of the state is equal to or greater than the given sequence number, then
+    /// returns the value.
+    pub fn sequenced_read_at(&mut self, seq: u64) -> Result<&S, Rx::RecvError> {
+        while self.state.seq < seq {
+            self.leader.recv()?.apply(&mut self.state);
+        }
+        Ok(&self.state.value)
     }
 }
 
@@ -184,51 +196,41 @@ mod test {
         let mut leader = Leader::new(420);
         let mut follower = Follower::follow(&mut leader);
 
+        assert_eq!(*follower.read(), 420);
+
         leader.update(69);
 
-        let f: i32 = *follower;
-        assert_eq!(f, 420);
-
-        follower.refresh();
-
-        let f: i32 = *follower;
-        assert_eq!(f, 69);
+        assert_eq!(*follower.read(), 69);
     }
 
-    // change notification: sequence numbers
     #[test]
     fn test_seq() {
-        let mut leader = Leader::new(420);
+        let mut leader = Leader::new(Sequenced::new(420));
         let mut follower = Follower::follow(&mut leader);
 
         assert_eq!(leader.seq(), 0);
 
-        leader.update(69);
+        leader.sequenced_update(69);
 
         assert_eq!(leader.seq(), 1);
         assert_eq!(follower.seq(), 0);
 
-        follower.refresh();
+        assert_eq!(*follower.sequenced_read(), 69);
 
         assert_eq!(follower.seq(), 1);
     }
 
-    // change notification: pulse
     #[test]
-    fn test_pulse() {
-        let mut leader = Leader::new(420);
+    fn test_seq_thread() {
+        let mut leader = Leader::new(Sequenced::new(420));
         let mut follower = Follower::follow(&mut leader);
 
-        let seq = leader.update(69);
-        let signal = follower.signal_at(seq);
+        assert_eq!(leader.seq(), 0);
 
-        let f: i32 = *follower;
-        assert_eq!(f, 420);
+        let join_handle = std::thread::spawn(move || *follower.sequenced_read_at(1).unwrap());
 
-        follower.refresh();
-        signal.wait().unwrap();
+        leader.sequenced_update(69);
 
-        let f: i32 = *follower;
-        assert_eq!(f, 69);
+        assert_eq!(join_handle.join().unwrap(), 69);
     }
 }
