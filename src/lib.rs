@@ -82,52 +82,42 @@ impl<U> Receiver<U> for mpsc::Receiver<U> {
 #[derive(Debug)]
 pub struct Leader<S, U: Update<S>, Tx: Sender<U>> {
     state: S,
-    followers: Vec<Tx>,
+    follower: Tx,
     _update: std::marker::PhantomData<U>,
 }
 
-impl<S: Clone, U: Update<S> + Clone, Tx: Sender<U>> Leader<S, U, Tx> {
-    pub fn new(state: S) -> Self {
+impl<S: Clone, U: Update<S>, Tx: Sender<U>> Leader<S, U, Tx> {
+    pub fn new(state: S, follower: Tx) -> Self {
         Self {
             state,
-            followers: Vec::new(),
+            follower,
             _update: std::marker::PhantomData,
         }
     }
 
-    pub fn update(&mut self, update: U)
+    pub fn update(&mut self, update: U) -> Result<(), Tx::SendError>
     where
         U: Update<S>,
     {
         update.apply(&mut self.state);
 
-        for i in (0..self.followers.len()).rev() {
-            if self.followers[i].send(update.clone()).is_err() {
-                self.followers.remove(i);
-            }
-        }
-    }
-
-    pub fn lead(&mut self, tx: Tx) {
-        self.followers.push(tx);
+        self.follower.send(update)
     }
 }
 
-impl<S: Clone, U: Update<S> + Clone, Tx: Sender<Sequenced<U>>>
-    Leader<Sequenced<S>, Sequenced<U>, Tx>
-{
+impl<S: Clone, U: Update<S>, Tx: Sender<Sequenced<U>>> Leader<Sequenced<S>, Sequenced<U>, Tx> {
     pub fn seq(&self) -> u64 {
         self.state.seq
     }
 
-    pub fn sequenced_update(&mut self, update: U) {
+    pub fn sequenced_update(&mut self, update: U) -> Result<(), Tx::SendError> {
         self.state.seq += 1;
         let sequenced_update = Sequenced {
             value: update,
             seq: self.state.seq,
         };
 
-        self.update(sequenced_update);
+        self.update(sequenced_update)
     }
 }
 
@@ -139,13 +129,11 @@ pub struct Follower<S, U: Update<S>, Rx: Receiver<U>> {
     _update: std::marker::PhantomData<U>,
 }
 
-impl<S: Clone, U: Update<S> + Clone> Follower<S, U, mpsc::Receiver<U>> {
-    pub fn follow(leader: &mut Leader<S, U, mpsc::Sender<U>>) -> Self {
-        let (tx, rx) = mpsc::channel();
-        leader.lead(tx);
+impl<S: Clone, U: Update<S>, Rx: Receiver<U>> Follower<S, U, Rx> {
+    pub fn new(state: S, leader: Rx) -> Self {
         Self {
-            state: leader.state.clone(),
-            leader: rx,
+            state,
+            leader,
             _update: std::marker::PhantomData,
         }
     }
@@ -187,30 +175,45 @@ impl<S: Clone, U: Update<S> + Clone, Rx: Receiver<Sequenced<U>>>
     }
 }
 
+// The most convenient way to construct a pair
+pub trait IntoLeaderFollower<S: Clone, U: Update<S>, Tx: Sender<U>, Rx: Receiver<U>> {
+    fn into_leader_follower(self, state: S) -> (Leader<S, U, Tx>, Follower<S, U, Rx>);
+}
+
+impl<S: Clone, U: Update<S>, Tx: Sender<U>, Rx: Receiver<U>> IntoLeaderFollower<S, U, Tx, Rx>
+    for (Tx, Rx)
+{
+    fn into_leader_follower(self, state: S) -> (Leader<S, U, Tx>, Follower<S, U, Rx>) {
+        let (tx, rx) = self;
+        let leader = Leader::new(state.clone(), tx);
+        let follower = Follower::new(state, rx);
+
+        (leader, follower)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
 
     #[test]
     fn test() {
-        let mut leader = Leader::new(420);
-        let mut follower = Follower::follow(&mut leader);
+        let (mut leader, mut follower) = mpsc::channel().into_leader_follower(420);
 
         assert_eq!(*follower.read(), 420);
 
-        leader.update(69);
+        leader.update(69).unwrap();
 
         assert_eq!(*follower.read(), 69);
     }
 
     #[test]
     fn test_seq() {
-        let mut leader = Leader::new(Sequenced::new(420));
-        let mut follower = Follower::follow(&mut leader);
+        let (mut leader, mut follower) = mpsc::channel().into_leader_follower(Sequenced::new(420));
 
         assert_eq!(leader.seq(), 0);
 
-        leader.sequenced_update(69);
+        leader.sequenced_update(69).unwrap();
 
         assert_eq!(leader.seq(), 1);
         assert_eq!(follower.seq(), 0);
@@ -222,14 +225,13 @@ mod test {
 
     #[test]
     fn test_seq_thread() {
-        let mut leader = Leader::new(Sequenced::new(420));
-        let mut follower = Follower::follow(&mut leader);
+        let (mut leader, mut follower) = mpsc::channel().into_leader_follower(Sequenced::new(420));
 
         assert_eq!(leader.seq(), 0);
 
         let join_handle = std::thread::spawn(move || *follower.sequenced_read_at(1).unwrap());
 
-        leader.sequenced_update(69);
+        leader.sequenced_update(69).unwrap();
 
         assert_eq!(join_handle.join().unwrap(), 69);
     }
