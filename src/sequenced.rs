@@ -25,3 +25,22 @@ where
         target.seq = self.seq;
     }
 }
+
+#[cfg(test)]
+mod test {
+    use crate::Update as _;
+
+    use super::Sequenced;
+
+    #[test]
+    fn apply() {
+        let mut x = Sequenced::new(420);
+
+        assert_eq!(x.seq, 0);
+
+        let y = Sequenced { value: 69, seq: 1 };
+        y.apply(&mut x);
+
+        assert_eq!(x.seq, 1);
+    }
+}
